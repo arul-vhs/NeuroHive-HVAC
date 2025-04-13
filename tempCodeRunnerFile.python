@@ -1,0 +1,44 @@
+import pandas as pd
+import os
+
+DATA_DIR = './data/' # Make sure this matches your setup
+TRAIN_CSV_PATH = os.path.join(DATA_DIR, 'train.csv')
+
+print(f"Checking '{TRAIN_CSV_PATH}' for buildings with meter type 1...")
+
+try:
+    # --- Option 1: Load a chunk (faster, less memory) ---
+    # Adjust chunksize or iterator if needed for very large files / low memory
+    chunk_iter = pd.read_csv(TRAIN_CSV_PATH, usecols=['building_id', 'meter'], chunksize=1000000) # Read 1 million rows at a time
+    buildings_with_meter1 = set()
+
+    for chunk in chunk_iter:
+        buildings_in_chunk = chunk[chunk['meter'] == 1]['building_id'].unique()
+        buildings_with_meter1.update(buildings_in_chunk)
+        # Optional: Break early if you find enough buildings
+        # if len(buildings_with_meter1) > 10:
+        #     break
+    
+    # --- Option 2: Load specific columns (might still use significant RAM) ---
+    # Uncomment this block and comment out Option 1 if Option 1 is too slow or fails
+    # print("Loading building_id and meter columns (this might take a moment)...")
+    # train_sample_df = pd.read_csv(TRAIN_CSV_PATH, usecols=['building_id', 'meter'])
+    # print("Filtering for meter type 1...")
+    # chilled_water_df = train_sample_df[train_sample_df['meter'] == 1]
+    # buildings_with_meter1 = chilled_water_df['building_id'].unique()
+    # del train_sample_df # Free up memory
+    # del chilled_water_df
+
+    if buildings_with_meter1:
+        sorted_buildings = sorted(list(buildings_with_meter1))
+        print("\nFound Building IDs with Meter Type 1 (Chilled Water):")
+        print(sorted_buildings)
+        print(f"\nSuggestion: Try using Building ID: {sorted_buildings[0]}") # Suggest the first one found
+    else:
+        print("\nNo buildings with meter type 1 found in the checked data.")
+        print("If using chunks (Option 1), maybe increase checks. If Option 2, the dataset might lack meter 1 data or there's another issue.")
+
+except FileNotFoundError:
+    print(f"Error: Cannot find {TRAIN_CSV_PATH}. Make sure it's in the '{DATA_DIR}' directory.")
+except Exception as e:
+    print(f"An error occurred: {e}")
