@@ -1,44 +1,471 @@
+import gymnasium as gym
+from gymnasium import spaces
+import numpy as np
 import pandas as pd
+import joblib
+import torch
 import os
+import random
 
-DATA_DIR = './data/' # Make sure this matches your setup
-TRAIN_CSV_PATH = os.path.join(DATA_DIR, 'train.csv')
-
-print(f"Checking '{TRAIN_CSV_PATH}' for buildings with meter type 1...")
-
+# Import the forecasting model class (assuming it's in train_forecaster.py)
+# Make sure train_forecaster.py is in the same directory or accessible in PYTHONPATH
 try:
-    # --- Option 1: Load a chunk (faster, less memory) ---
-    # Adjust chunksize or iterator if needed for very large files / low memory
-    chunk_iter = pd.read_csv(TRAIN_CSV_PATH, usecols=['building_id', 'meter'], chunksize=1000000) # Read 1 million rows at a time
-    buildings_with_meter1 = set()
+    from train_forecaster import LSTM_TCN_Forecaster, Config as ForecastConfig
+except ImportError as e:
+    print("Error importing forecasting model components.")
+    print("Make sure 'train_forecaster.py' is accessible and contains LSTM_TCN_Forecaster and Config.")
+    print(f"Specific error: {e}")
+    # Provide dummy classes if import fails, to allow environment definition
+    class ForecastConfig:
+        SEQ_LENGTH = 24
+        PREDICTION_HORIZON = 6
+        DEVICE = torch.device("cpu")
+        INPUT_FEATURES = 60 # Example value, ensure it matches your saved model/scaler
+        LSTM_HIDDEN_SIZE = 64
+        LSTM_LAYERS = 2
+        TCN_CHANNELS = [64, 128]
+        TCN_KERNEL_SIZE = 3
+        TCN_DROPOUT = 0.2
+        OUTPUT_SIZE = 1
+    class LSTM_TCN_Forecaster(torch.nn.Module):
+        def __init__(self, *args, **kwargs): super().__init__(); self.fc = torch.nn.Linear(1,1)
+        def forward(self, x): return torch.randn(x.size(0), ForecastConfig.PREDICTION_HORIZON)
 
-    for chunk in chunk_iter:
-        buildings_in_chunk = chunk[chunk['meter'] == 1]['building_id'].unique()
-        buildings_with_meter1.update(buildings_in_chunk)
-        # Optional: Break early if you find enough buildings
-        # if len(buildings_with_meter1) > 10:
-        #     break
-    
-    # --- Option 2: Load specific columns (might still use significant RAM) ---
-    # Uncomment this block and comment out Option 1 if Option 1 is too slow or fails
-    # print("Loading building_id and meter columns (this might take a moment)...")
-    # train_sample_df = pd.read_csv(TRAIN_CSV_PATH, usecols=['building_id', 'meter'])
-    # print("Filtering for meter type 1...")
-    # chilled_water_df = train_sample_df[train_sample_df['meter'] == 1]
-    # buildings_with_meter1 = chilled_water_df['building_id'].unique()
-    # del train_sample_df # Free up memory
-    # del chilled_water_df
 
-    if buildings_with_meter1:
-        sorted_buildings = sorted(list(buildings_with_meter1))
-        print("\nFound Building IDs with Meter Type 1 (Chilled Water):")
-        print(sorted_buildings)
-        print(f"\nSuggestion: Try using Building ID: {sorted_buildings[0]}") # Suggest the first one found
-    else:
-        print("\nNo buildings with meter type 1 found in the checked data.")
-        print("If using chunks (Option 1), maybe increase checks. If Option 2, the dataset might lack meter 1 data or there's another issue.")
+# --- Environment Constants ---
+# These are simplified physical parameters - needing tuning for real-world accuracy
+HEAT_CAPACITY_AIR = 1005  # J/(kg*K) Specific heat capacity of air
+AIR_DENSITY = 1.225       # kg/m^3 Density of air
+ROOM_VOLUME = 5 * 5 * 3   # m^3 Example room volume (5m x 5m x 3m)
+ROOM_MASS_AIR = ROOM_VOLUME * AIR_DENSITY # kg
+ROOM_THERMAL_MASS_CAPACITY = ROOM_MASS_AIR * HEAT_CAPACITY_AIR # J/K - Simplified
 
-except FileNotFoundError:
-    print(f"Error: Cannot find {TRAIN_CSV_PATH}. Make sure it's in the '{DATA_DIR}' directory.")
-except Exception as e:
-    print(f"An error occurred: {e}")
+# Thermal resistance (higher means better insulation) - units K/W (Kelvin per Watt)
+WALL_AREA = (5*3)*4 + (5*5) # Area of 4 walls + ceiling (ignore floor for simplicity)
+WALL_U_VALUE = 1.5          # W/(m^2*K) Overall heat transfer coefficient (lower is better insulation)
+WALL_R_VALUE = 1 / (WALL_U_VALUE * WALL_AREA) # K/W
+
+# Cooling power of HVAC states (Watts) - Adjust these based on system specs
+COOLING_POWER_LOW = 3000  # W (e.g., ~10k BTU/hr)
+COOLING_POWER_HIGH = 6000 # W (e.g., ~20k BTU/hr)
+
+# Internal heat gain (Watts) - Simplified, e.g., from people, equipment
+INTERNAL_GAIN_OCCUPIED = 500 # W
+INTERNAL_GAIN_UNOCCUPIED = 50 # W
+
+# Simulation time step (seconds) - Should match data frequency (1 hour = 3600s)
+TIME_STEP = 3600
+
+# Comfort range
+COMFORT_LOW = 21.0  # degrees C
+COMFORT_HIGH = 24.0 # degrees C
+
+# Energy costs (arbitrary units, relative cost matters)
+ENERGY_COST_OFF = 0.0
+ENERGY_COST_FAN_ONLY = 0.1 # Assume fan has some cost
+ENERGY_COST_LOW = 1.0
+ENERGY_COST_HIGH = 2.0
+
+# Penalty for discomfort (quadratic)
+DISCOMFORT_PENALTY_FACTOR = 5.0
+
+# Penalty for rapid cycling (per change)
+CYCLING_PENALTY = 0.5
+
+
+class HVACEnv(gym.Env):
+    """
+    Custom Gymnasium Environment for HVAC Control Simulation.
+
+    Uses a simple physics-based model for temperature dynamics.
+    Integrates a pre-trained forecasting model for model-aware RL.
+    """
+    metadata = {'render_modes': ['human', 'ansi']}
+
+    def __init__(self, data_csv_path, forecast_model_path, feature_scaler_path, target_scaler_path, render_mode=None):
+        super().__init__()
+
+        self.render_mode = render_mode
+
+        # --- Load external data and models ---
+        print("Initializing HVAC Environment...")
+        try:
+            self.data = pd.read_csv(data_csv_path, index_col='timestamp', parse_dates=True)
+            self.feature_scaler = joblib.load(feature_scaler_path)
+            self.target_scaler = joblib.load(target_scaler_path)
+            print("Data and scalers loaded.")
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"Error loading environment resources: {e}. Ensure paths are correct.") from e
+        except Exception as e:
+            raise RuntimeError(f"Error initializing environment resources: {e}") from e
+
+        # --- Load Forecasting Model ---
+        self.forecast_config = ForecastConfig() # Use config from forecast script
+        self.forecaster = LSTM_TCN_Forecaster(
+             input_size=self.forecast_config.INPUT_FEATURES,
+             lstm_hidden_size=self.forecast_config.LSTM_HIDDEN_SIZE,
+             lstm_layers=self.forecast_config.LSTM_LAYERS,
+             tcn_channels=self.forecast_config.TCN_CHANNELS,
+             tcn_kernel_size=self.forecast_config.TCN_KERNEL_SIZE,
+             tcn_dropout=self.forecast_config.TCN_DROPOUT,
+             output_size=self.forecast_config.OUTPUT_SIZE,
+             pred_horizon=self.forecast_config.PREDICTION_HORIZON
+        ).to(self.forecast_config.DEVICE)
+        try:
+             self.forecaster.load_state_dict(torch.load(forecast_model_path, map_location=self.forecast_config.DEVICE))
+             self.forecaster.eval() # Set to evaluation mode
+             print("Forecasting model loaded successfully.")
+        except FileNotFoundError:
+             raise FileNotFoundError(f"Forecasting model not found at {forecast_model_path}")
+        except Exception as e:
+             raise RuntimeError(f"Error loading forecasting model state dict: {e}." \
+                                "Ensure model architecture matches saved file.") from e
+
+
+        # --- Define Action Space ---
+        # 0: OFF, 1: FAN_ONLY, 2: COOL_LOW, 3: COOL_HIGH
+        self.action_space = spaces.Discrete(4)
+        self._action_to_state_map = {
+            0: {'name': 'OFF', 'power': 0, 'energy': ENERGY_COST_OFF},
+            1: {'name': 'FAN_ONLY', 'power': 0, 'energy': ENERGY_COST_FAN_ONLY}, # No cooling power, just energy cost
+            2: {'name': 'COOL_LOW', 'power': COOLING_POWER_LOW, 'energy': ENERGY_COST_LOW},
+            3: {'name': 'COOL_HIGH', 'power': COOLING_POWER_HIGH, 'energy': ENERGY_COST_HIGH},
+        }
+
+        # --- Define Observation Space ---
+        # Needs to accommodate all state variables:
+        # current_temp, outdoor_temp, outdoor_humidity (or dew_temp),
+        # forecast_temps (N steps), forecast_outdoor (N steps),
+        # current_hvac_state (action), time_features (sin/cos hour, day), comfort band info
+        # Ensure all are scaled or appropriately represented.
+
+        # Example:
+        # [current_temp_scaled, outdoor_temp_scaled, dew_temp_scaled,
+        #  forecast_temp_h1, forecast_temp_h2, ..., forecast_temp_h6, # Scaled forecast from model
+        #  hour_sin, hour_cos, dayofweek_sin, dayofweek_cos,
+        #  current_action_encoded (e.g., one-hot),
+        #  comfort_low_scaled, comfort_high_scaled]
+
+        # Determine bounds (MinMax scaling puts most between 0 and 1)
+        # Forecasts from the model are also scaled (0-1 range).
+        # Need to estimate the size based on features + forecast horizon + encoded action etc.
+        forecast_len = self.forecast_config.PREDICTION_HORIZON
+        time_features = 4 # hour_sin/cos, dayofweek_sin/cos (example)
+        action_encoding = self.action_space.n # One-hot encoding size
+        num_base_features = 3 # current temp, outdoor temp, dew temp
+        num_comfort_features = 2 # low/high band
+
+        obs_size = num_base_features + forecast_len + time_features + action_encoding + num_comfort_features
+
+        # Define low and high bounds for observation space (mostly 0-1 due to scaling)
+        # Use -inf/inf for safety, although most should be constrained
+        low_bounds = np.full(obs_size, -np.inf, dtype=np.float32)
+        high_bounds = np.full(obs_size, np.inf, dtype=np.float32)
+        # Refine bounds for known scaled features (0 to 1) and encoded features
+        low_bounds[0:num_base_features] = 0.0 # Scaled temps
+        high_bounds[0:num_base_features] = 1.0
+        low_bounds[num_base_features : num_base_features+forecast_len] = 0.0 # Scaled forecast
+        high_bounds[num_base_features : num_base_features+forecast_len] = 1.0
+        low_bounds[num_base_features+forecast_len : num_base_features+forecast_len+time_features] = -1.0 # Sin/Cos
+        high_bounds[num_base_features+forecast_len : num_base_features+forecast_len+time_features] = 1.0
+        low_bounds[num_base_features+forecast_len+time_features : num_base_features+forecast_len+time_features+action_encoding] = 0.0 # One-hot action
+        high_bounds[num_base_features+forecast_len+time_features : num_base_features+forecast_len+time_features+action_encoding] = 1.0
+        low_bounds[-num_comfort_features:] = 0.0 # Scaled comfort band
+        high_bounds[-num_comfort_features:] = 1.0
+
+        self.observation_space = spaces.Box(low=low_bounds, high=high_bounds, dtype=np.float32)
+
+        # --- Environment State Variables ---
+        self.current_data_index = -1
+        self.current_temp_c = 22.0 # Initial temperature
+        self.current_action = 0 # Start OFF
+        self.steps_taken = 0
+        self.max_steps = len(self.data) - self.forecast_config.SEQ_LENGTH - self.forecast_config.PREDICTION_HORIZON - 1 # Ensure we don't run out of data for forecast
+
+
+    def _get_observation(self):
+        # Get current row of data based on index
+        # Note: We need SEQ_LENGTH history to feed the forecaster
+        start_idx = self.current_data_index
+        end_idx = start_idx + self.forecast_config.SEQ_LENGTH
+
+        if end_idx > len(self.data):
+             print(f"Warning: Not enough future data for forecast input at index {self.current_data_index}. This shouldn't happen with max_steps check.")
+             # Handle gracefully, maybe return last valid observation or zeros?
+             # For now, let's assume max_steps prevents this.
+             # If it does happen, error out or return a default state.
+             raise IndexError("Attempting to access data beyond bounds for forecasting.")
+
+        # Get the sequence needed for the forecaster
+        # Make sure columns match exactly what the forecaster was trained on (order matters!)
+        # We load the *original* featured data here, scale it, then predict.
+        try:
+            raw_sequence_df = self.data.iloc[start_idx:end_idx]
+            # Separate features (must match scaler's feature list)
+            feature_cols = self.feature_scaler.feature_names_in_
+            sequence_features = raw_sequence_df[feature_cols]
+
+            # Scale the features using the loaded scaler
+            scaled_features = self.feature_scaler.transform(sequence_features)
+
+            # Prepare tensor for the forecaster
+            features_tensor = torch.FloatTensor(scaled_features).unsqueeze(0).to(self.forecast_config.DEVICE) # Add batch dim
+
+        except Exception as e:
+            print(f"Error preparing data for forecast at index {self.current_data_index}: {e}")
+            print(f"Required columns: {self.feature_scaler.feature_names_in_}")
+            print(f"Available columns: {self.data.columns.tolist()}")
+            raise
+
+        # --- Get Forecast ---
+        with torch.no_grad():
+            # forecast_scaled shape: (1, pred_horizon) -> squeeze to (pred_horizon,)
+            forecast_scaled = self.forecaster(features_tensor).squeeze(0).cpu().numpy()
+
+        # --- Get Current Real-World State from Data ---
+        current_data_row = self.data.iloc[end_idx - 1] # Use the *last* point of the input sequence as "current"
+        outdoor_temp = current_data_row['air_temperature'] # Example feature name
+        dew_temp = current_data_row['dew_temperature']   # Example feature name
+        hour_sin = current_data_row['hour_sin']
+        hour_cos = current_data_row['hour_cos']
+        dayofweek_sin = current_data_row['dayofweek_sin']
+        dayofweek_cos = current_data_row['dayofweek_cos']
+
+        # --- Scale Current State Variables ---
+        # Use the target scaler for temperatures (assuming it scales a single temp feature)
+        # Need reshape [[value]] for scaler expecting 2D array
+        current_temp_scaled = self.target_scaler.transform(np.array([[self.current_temp_c]]))[0, 0]
+        outdoor_temp_scaled = self.target_scaler.transform(np.array([[outdoor_temp]]))[0, 0]
+        dew_temp_scaled = self.target_scaler.transform(np.array([[dew_temp]]))[0, 0] # Assuming dew_temp has similar scale to temp
+        comfort_low_scaled = self.target_scaler.transform(np.array([[COMFORT_LOW]]))[0, 0]
+        comfort_high_scaled = self.target_scaler.transform(np.array([[COMFORT_HIGH]]))[0, 0]
+
+        # --- Encode Current Action ---
+        action_one_hot = np.zeros(self.action_space.n, dtype=np.float32)
+        action_one_hot[self.current_action] = 1.0
+
+        # --- Concatenate into Final Observation Vector ---
+        observation = np.concatenate([
+            np.array([current_temp_scaled, outdoor_temp_scaled, dew_temp_scaled], dtype=np.float32),
+            forecast_scaled.astype(np.float32),
+            np.array([hour_sin, hour_cos, dayofweek_sin, dayofweek_cos], dtype=np.float32),
+            action_one_hot,
+            np.array([comfort_low_scaled, comfort_high_scaled], dtype=np.float32)
+        ])
+
+        # Sanity check shape
+        expected_len = self.observation_space.shape[0]
+        if len(observation) != expected_len:
+             print(f"FATAL: Observation length mismatch. Expected {expected_len}, Got {len(observation)}")
+             # You might want to debug individual component lengths here
+             raise ValueError("Observation length mismatch.")
+
+        return observation
+
+    def _get_info(self):
+        # Provide auxiliary info not part of the state
+        return {
+            "current_temp_c": self.current_temp_c,
+            "outdoor_temp_c": self.data.iloc[self.current_data_index + self.forecast_config.SEQ_LENGTH - 1]['air_temperature'],
+            "current_action": self._action_to_state_map[self.current_action]['name'],
+            "data_timestamp": self.data.index[self.current_data_index + self.forecast_config.SEQ_LENGTH - 1]
+        }
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed) # Important for reproducibility
+
+        # Reset environment state
+        # Start at a random point in the first half of the data to ensure enough future data
+        max_start_index = max(0, (len(self.data) // 2) - self.forecast_config.SEQ_LENGTH - self.forecast_config.PREDICTION_HORIZON)
+        self.current_data_index = random.randint(0, max_start_index)
+
+        # Reset temperature to something reasonable or based on data at start index
+        self.current_temp_c = 22.5 # Reset to a typical comfortable temp
+        self.current_action = 0 # Reset action to OFF
+        self.steps_taken = 0
+
+        print(f"Environment reset. Start index: {self.current_data_index}, Start temp: {self.current_temp_c:.1f}C")
+
+        observation = self._get_observation()
+        info = self._get_info()
+
+        if self.render_mode == "human":
+            self._render_human(info, 0) # Render initial state
+
+        return observation, info
+
+
+    def step(self, action):
+        # --- 1. Apply action and calculate energy/cycling cost ---
+        previous_action = self.current_action
+        self.current_action = action
+        hvac_state = self._action_to_state_map[self.current_action]
+        cooling_power = hvac_state['power'] # Watts (negative heat flow)
+        energy_cost = hvac_state['energy']
+
+        cycling_cost = 0
+        if self.current_action != previous_action:
+            # Basic cycling penalty - could be more sophisticated (e.g., penalize compressor start)
+             if (previous_action in [2,3] and self.current_action not in [2,3]) or \
+                (previous_action not in [2,3] and self.current_action in [2,3]): # Compressor state changed
+                 cycling_cost = CYCLING_PENALTY
+
+
+        # --- 2. Get current external conditions & internal load ---
+        # Use data corresponding to the END of the forecast input window as "current"
+        current_data_idx_for_dynamics = self.current_data_index + self.forecast_config.SEQ_LENGTH - 1
+        current_data_row = self.data.iloc[current_data_idx_for_dynamics]
+        outdoor_temp_c = current_data_row['air_temperature']
+        # Simple occupancy model based on time of day (e.g., occupied 9-17 on weekdays)
+        timestamp = current_data_row.name # Get timestamp from index
+        is_occupied = 9 <= timestamp.hour < 17 and timestamp.dayofweek < 5 # Mon-Fri, 9am-5pm
+        internal_gain = INTERNAL_GAIN_OCCUPIED if is_occupied else INTERNAL_GAIN_UNOCCUPIED
+
+
+        # --- 3. Simulate temperature change using simple physics ---
+        # Heat flow = dQ/dt (Watts = J/s)
+        # Change in Temp = dT = (dQ / C) over time dt
+
+        # Heat gain/loss from outside: (T_outdoor - T_indoor) / R_thermal
+        heat_flow_external = (outdoor_temp_c - self.current_temp_c) / WALL_R_VALUE # Watts
+
+        # Net heat flow into room (positive heats room, negative cools)
+        # External gain + Internal gain - HVAC cooling
+        net_heat_flow = heat_flow_external + internal_gain - cooling_power # Watts
+
+        # Temperature change over the time step
+        # dT = (net_heat_flow * TIME_STEP) / ROOM_THERMAL_MASS_CAPACITY
+        delta_temp = (net_heat_flow * TIME_STEP) / ROOM_THERMAL_MASS_CAPACITY # degrees K or C change
+
+        self.current_temp_c += delta_temp
+
+        # --- 4. Calculate comfort cost ---
+        discomfort_cost = 0
+        if self.current_temp_c < COMFORT_LOW:
+            discomfort_cost = DISCOMFORT_PENALTY_FACTOR * (COMFORT_LOW - self.current_temp_c)**2
+        elif self.current_temp_c > COMFORT_HIGH:
+            discomfort_cost = DISCOMFORT_PENALTY_FACTOR * (self.current_temp_c - COMFORT_HIGH)**2
+
+        # --- 5. Calculate Reward ---
+        # Maximize reward = Minimize costs
+        reward = - (energy_cost + discomfort_cost + cycling_cost)
+
+        # --- 6. Update state for next step ---
+        self.current_data_index += 1
+        self.steps_taken += 1
+
+        # --- 7. Check for Termination/Truncation ---
+        terminated = False # No specific goal state defined here
+        truncated = self.steps_taken >= self.max_steps \
+                 or self.current_data_index >= (len(self.data) - self.forecast_config.SEQ_LENGTH - self.forecast_config.PREDICTION_HORIZON)
+
+        if truncated:
+             print(f"Episode truncated at step {self.steps_taken}.")
+
+
+        # --- 8. Get next observation and info ---
+        # Need exception handling here in case data runs out despite checks
+        try:
+             observation = self._get_observation()
+        except IndexError:
+             # This might happen if max_steps calculation wasn't quite right
+             print(f"Error getting observation at step {self.steps_taken}, index {self.current_data_index}. Truncating.")
+             truncated = True
+             # Return last known good observation or a default one? Depends on RL lib handling.
+             # Let's try returning a zero observation.
+             observation = np.zeros(self.observation_space.shape, dtype=np.float32)
+
+
+        info = self._get_info()
+        # Add reward components to info for debugging/logging
+        info["reward"] = reward
+        info["energy_cost"] = -energy_cost
+        info["discomfort_cost"] = -discomfort_cost
+        info["cycling_cost"] = -cycling_cost
+
+
+        if self.render_mode == "human":
+             self._render_human(info, reward)
+
+        # Return: observation, reward, terminated, truncated, info
+        return observation, reward, terminated, truncated, info
+
+
+    def render(self):
+        if self.render_mode == 'ansi':
+            info = self._get_info()
+            output = f"Timestamp: {info['data_timestamp']}, Temp: {info['current_temp_c']:.1f}C, " \
+                     f"Outdoor: {info['outdoor_temp_c']:.1f}C, Action: {info['current_action']}"
+            if 'reward' in info: # Reward is added during step
+                 output += f", Reward: {info['reward']:.2f}"
+            return output
+        elif self.render_mode == "human":
+            # Human rendering is handled within step/reset for simplicity here
+            pass # Currently handled by _render_human called internally
+
+    def _render_human(self, info, reward):
+        # Basic text-based rendering for human mode
+         print(f"Timestamp: {info['data_timestamp']} | Temp: {info['current_temp_c']:.1f}°C "
+               f"(Out: {info['outdoor_temp_c']:.1f}°C) | Action: {info['current_action']:<9} | "
+               f"Reward: {reward:<6.2f} "
+               f"[E:{info.get('energy_cost',0):.1f} D:{info.get('discomfort_cost',0):.1f} C:{info.get('cycling_cost',0):.1f}]")
+
+
+    def close(self):
+        print("Closing HVAC Environment.")
+        # Add any necessary cleanup here
+        pass
+
+# --- Example Usage (Optional: for testing the environment) ---
+if __name__ == '__main__':
+    print("Testing HVACEnv...")
+
+    # --- Use paths from your configuration ---
+    cfg = ForecastConfig() # Use the forecast config to find related files
+    env_config = {
+        "data_csv_path": cfg.original_featured_file, # Use the UN-SCALED featured data
+        "forecast_model_path": cfg.model_save_path,
+        "feature_scaler_path": cfg.feature_scaler_file,
+        "target_scaler_path": cfg.target_scaler_file,
+        "render_mode": "human" # or 'ansi' or None
+    }
+
+    try:
+        env = HVACEnv(**env_config)
+
+        # Test reset
+        obs, info = env.reset()
+        print("Reset successful.")
+        print("Initial Observation Shape:", obs.shape)
+        print("Initial Info:", info)
+
+        # Test step with random actions
+        print("\nTesting step function with random actions...")
+        total_reward = 0
+        for i in range(10): # Test 10 steps
+            action = env.action_space.sample() # Sample a random action
+            print(f"\n--- Step {i+1} ---")
+            print(f"Action Taken: {env._action_to_state_map[action]['name']} ({action})")
+            obs, reward, terminated, truncated, info = env.step(action)
+            total_reward += reward
+            print("Observation Shape:", obs.shape)
+            # print("Observation Sample:", obs[:10]) # Print part of observation
+            print("Info:", info)
+            print(f"Terminated: {terminated}, Truncated: {truncated}")
+            # Render is handled internally if mode='human'
+
+            if terminated or truncated:
+                print("Episode ended.")
+                break
+        print(f"\nTotal reward over {i+1} random steps: {total_reward:.2f}")
+
+        env.close()
+        print("\nEnvironment test finished.")
+
+    except FileNotFoundError as e:
+        print(f"\nERROR: Could not run test. File not found: {e}")
+        print("Please ensure all necessary files (data, model, scalers) exist in the './output/' directory.")
+    except Exception as e:
+        print(f"\nERROR: An unexpected error occurred during testing: {e}")
+        import traceback
+        traceback.print_exc()
