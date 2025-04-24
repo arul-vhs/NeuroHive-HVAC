@@ -178,7 +178,7 @@ class HVACEnv(gym.Env):
         self.current_discrete_action = mapped_discrete_action
         hvac_state = self._discrete_action_to_state_map[self.current_discrete_action]
         cooling_power = hvac_state['power']; energy_cost = hvac_state['energy']
-        cycling_cost = 0;
+        cycling_cost = 0
         if (self.current_discrete_action in [2,3]) != (previous_discrete_action in [2,3]): cycling_cost = CYCLING_PENALTY
 
         # --- Get conditions & Simulate temp ---
